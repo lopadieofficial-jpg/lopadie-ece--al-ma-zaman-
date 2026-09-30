@@ -12,8 +12,6 @@ OPERATIONS = 'C0C36ANFXQS'
 REPORTS = 'C0C2R2EJJ79'
 APPROVALS = 'C0C36A6CHR8'
 SUPPORT = 'C0C36ASERD0'
-# Kaan + Ece's private working room. Individual department workers join as
-# their own Slack apps when each has a separately authorized bot identity.
 ACTIVE_DEPARTMENTS = 'C0C3K46MGBC'
 CHANNELS = {OPERATIONS, REPORTS, APPROVALS, SUPPORT, ACTIVE_DEPARTMENTS}
 DEPARTMENT_CHANNELS = {
@@ -35,18 +33,15 @@ def accepted(body):
             and isinstance(e.get('ts'), str) and bool(e.get('text', '').strip()))
 
 def event_key(e):
-    # An app_mention and message event can represent the same message.
     return e['channel'] + ':' + e['ts']
 
 def relative_delay_seconds(text):
-    """Return a short Turkish relative delay, if the sender explicitly requested one."""
     match = re.search(r'\b(\d{1,3})\s*(dakika|dk|saat)\s+sonra\b', text.lower())
     if not match:
         return None
     amount = int(match.group(1))
     multiplier = 3600 if match.group(2) == 'saat' else 60
     seconds = amount * multiplier
-    # Keep ad-hoc Slack scheduling bounded; long recurring scheduling needs an explicit setup.
     return seconds if 60 <= seconds <= 8 * 3600 else None
 
 def schedule(now):
@@ -65,6 +60,7 @@ class Store:
         with self.db() as db:
             db.execute('PRAGMA journal_mode=WAL')
             db.execute('CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, payload TEXT, state TEXT, output TEXT, error TEXT, created TEXT, due TEXT)')
+            db.execute('CREATE TABLE IF NOT EXISTS memory (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, text TEXT, source TEXT, created TEXT)')
             columns = {row[1] for row in db.execute('PRAGMA table_info(jobs)')}
             if 'due' not in columns:
                 db.execute('ALTER TABLE jobs ADD COLUMN due TEXT')
@@ -91,7 +87,6 @@ class Store:
         return [{'id':r[0], 'request':json.loads(r[1]), 'delivery_state':r[2], 'reply':r[3]} for r in reversed(rows)]
 
     def active_work(self):
-        """Return the earliest real queued work item, never an invented availability state."""
         with self.db() as db:
             rows = db.execute("SELECT id,payload,due,state FROM jobs WHERE state IN ('pending','prepared','sending') ORDER BY COALESCE(due,created), created LIMIT 20").fetchall()
         for key, raw, due, state in rows:
@@ -99,3 +94,18 @@ class Store:
             if payload.get('kind') in {'delayed_reply', 'working_reply'}:
                 return {'id': key, 'payload': payload, 'due': due, 'state': state}
         return None
+
+    def remember(self, kind, text, source):
+        clean = ' '.join((text or '').split())[:2000]
+        if not clean:
+            return
+        with self.db() as db:
+            exists = db.execute('SELECT 1 FROM memory WHERE kind=? AND text=? LIMIT 1', (kind, clean)).fetchone()
+            if not exists:
+                db.execute('INSERT INTO memory (kind,text,source,created) VALUES (?,?,?,?)',
+                           (kind, clean, source, datetime.now(TZ).isoformat()))
+
+    def memories(self, limit=80):
+        with self.db() as db:
+            rows = db.execute('SELECT kind,text,source,created FROM memory ORDER BY id DESC LIMIT ?', (limit,)).fetchall()
+        return [{'kind':r[0], 'text':r[1], 'source':r[2], 'created':r[3]} for r in reversed(rows)]
